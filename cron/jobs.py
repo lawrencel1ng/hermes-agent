@@ -12,12 +12,16 @@ import tempfile
 import os
 import re
 import uuid
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
 
 logger = logging.getLogger(__name__)
+
+# Thread-safe lock for jobs.json file operations
+_jobs_file_lock = threading.Lock()
 
 from hermes_time import now as _hermes_now
 
@@ -306,9 +310,17 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     elif schedule["kind"] == "cron":
         if not HAS_CRONITER:
             return None
-        cron = croniter(schedule["expr"], now)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        expr = schedule.get("expr") or schedule.get("expression")
+        if not expr:
+            logger.warning("Cron job missing expr/expression field: %s", schedule)
+            return None
+        try:
+            cron = croniter(expr, now)
+            next_run = cron.get_next(datetime)
+            return next_run.isoformat()
+        except Exception as e:
+            logger.warning("Invalid cron expression '%s': %s", expr, e)
+            return None
 
     return None
 
@@ -318,36 +330,37 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # =============================================================================
 
 def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
-    ensure_dirs()
-    if not JOBS_FILE.exists():
-        return []
-    
-    try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data.get("jobs", [])
-    except json.JSONDecodeError:
-        # Retry with strict=False to handle bare control chars in string values
+    """Load all jobs from storage (thread-safe)."""
+    with _jobs_file_lock:
+        ensure_dirs()
+        if not JOBS_FILE.exists():
+            return []
+        
         try:
             with open(JOBS_FILE, 'r', encoding='utf-8') as f:
-                data = json.loads(f.read(), strict=False)
-                jobs = data.get("jobs", [])
-                if jobs:
-                    # Auto-repair: rewrite with proper escaping
-                    save_jobs(jobs)
-                    logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-                return jobs
-        except Exception as e:
-            logger.error("Failed to auto-repair jobs.json: %s", e)
-            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
-    except IOError as e:
-        logger.error("IOError reading jobs.json: %s", e)
-        raise RuntimeError(f"Failed to read cron database: {e}") from e
+                data = json.load(f)
+                return data.get("jobs", [])
+        except json.JSONDecodeError:
+            # Retry with strict=False to handle bare control chars in string values
+            try:
+                with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.loads(f.read(), strict=False)
+                    jobs = data.get("jobs", [])
+                    if jobs:
+                        # Auto-repair: rewrite with proper escaping
+                        _save_jobs_unlocked(jobs)
+                        logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+                    return jobs
+            except Exception as e:
+                logger.error("Failed to auto-repair jobs.json: %s", e)
+                raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+        except IOError as e:
+            logger.error("IOError reading jobs.json: %s", e)
+            raise RuntimeError(f"Failed to read cron database: {e}") from e
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+    """Save jobs without acquiring lock (caller must hold lock)."""
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
@@ -363,6 +376,12 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         except OSError:
             pass
         raise
+
+
+def save_jobs(jobs: List[Dict[str, Any]]):
+    """Save all jobs to storage (thread-safe)."""
+    with _jobs_file_lock:
+        _save_jobs_unlocked(jobs)
 
 
 def create_job(
@@ -676,63 +695,67 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     needs_save = False
 
     for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            if not recovered_next:
+        try:
+            if not job.get("enabled", True):
                 continue
 
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
-                job.get("name", job["id"]),
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
+            next_run = job.get("next_run_at")
+            if not next_run:
+                recovered_next = _recoverable_oneshot_run_at(
+                    job.get("schedule", {}),
+                    now,
+                    last_run_at=job.get("last_run_at"),
+                )
+                if not recovered_next:
+                    continue
 
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
+                job["next_run_at"] = recovered_next
+                next_run = recovered_next
+                logger.info(
+                    "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                    job.get("name", job["id"]),
+                    recovered_next,
+                )
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["next_run_at"] = recovered_next
+                        needs_save = True
+                        break
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
+            next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
+            if next_run_dt <= now:
+                schedule = job.get("schedule", {})
+                kind = schedule.get("kind")
 
-            due.append(job)
+                # For recurring jobs, check if the scheduled time is stale
+                # (gateway was down and missed the window). Fast-forward to
+                # the next future occurrence instead of firing a stale run.
+                grace = _compute_grace_seconds(schedule)
+                if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                    # Job is past its catch-up grace window — this is a stale missed run.
+                    # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
+                    new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next:
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Fast-forwarding to next run: %s",
+                            job.get("name", job["id"]),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
+                        # Update the job in storage
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        continue  # Skip this run
+
+                due.append(job)
+        except Exception as e:
+            logger.error("Error processing job '%s' in get_due_jobs: %s", job.get("name", job["id"]), e)
+            continue
 
     if needs_save:
         save_jobs(raw_jobs)
