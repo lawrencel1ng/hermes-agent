@@ -6,8 +6,6 @@ calls this every 60 seconds from a background thread.
 
 Uses a file-based lock (~/.hermes/cron/.tick.lock) so only one tick
 runs at a time if multiple processes overlap.
-
-Jobs are executed concurrently (up to 8 workers) after the tick lock is released.
 """
 
 import asyncio
@@ -64,12 +62,6 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
-
-# Maximum concurrent job workers
-MAX_WORKERS = int(os.getenv("HERMES_CRON_WORKERS", "8"))
-if MAX_WORKERS < 1:
-    MAX_WORKERS = 8
-logger.info("Cron scheduler configured with %d concurrent workers", MAX_WORKERS)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -741,14 +733,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
-        # Force temperature=0.6 for kimi-for-coding model
-        request_overrides = {}
-        _is_kimi_model = "kimi" in (turn_route["model"] or "").lower()
-        _is_kimi_endpoint = "api.kimi.com" in (turn_route["runtime"].get("base_url") or "").lower()
-        if _is_kimi_model or _is_kimi_endpoint:
-            request_overrides["temperature"] = 0.6
-            logger.info("Job '%s': forcing temperature=0.6 for Kimi (model=%s, base_url=%s)", job_id, turn_route["model"], turn_route["runtime"].get("base_url"))
-        
         agent = AIAgent(
             model=turn_route["model"],
             api_key=turn_route["runtime"].get("api_key"),
@@ -773,7 +757,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
-            request_overrides=request_overrides,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -923,54 +906,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
-# Maximum time a job can stay paused before auto-resume (24 hours)
-_STUCK_PAUSE_THRESHOLD_HOURS = 24
-
-
-def _auto_resume_stuck_jobs() -> int:
-    """Auto-resume jobs that have been paused for > 24h without manual intervention.
-    
-    Jobs can get stuck in paused state after maintenance windows or system restarts.
-    This health check prevents permanent stuck jobs by auto-resuming them.
-    
-    Returns the number of jobs resumed.
-    """
-    from cron.jobs import load_jobs, resume_job, _hermes_now
-    
-    jobs = load_jobs()
-    now = _hermes_now()
-    resumed = 0
-    
-    for job in jobs:
-        paused_at = job.get("paused_at")
-        if not paused_at:
-            continue
-            
-        # Skip if manually paused (has a reason)
-        if job.get("paused_reason"):
-            continue
-            
-        # Check if paused for > 24h
-        try:
-            from hermes_time import parse_iso_time
-            paused_time = parse_iso_time(paused_at)
-            if paused_time is None:
-                continue
-            hours_paused = (now - paused_time).total_seconds() / 3600
-            if hours_paused < _STUCK_PAUSE_THRESHOLD_HOURS:
-                continue
-        except Exception as e:
-            logger.debug("Failed to parse paused_at for job %s: %s", job.get("id"), e)
-            continue
-            
-        # Auto-resume the stuck job
-        logger.info("Auto-resuming stuck job '%s' (paused for %.1fh)", job.get("name", job["id"]), hours_paused)
-        resume_job(job["id"])
-        resumed += 1
-    
-    return resumed
-
-
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -988,35 +923,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Check for orphaned/stale lock file
-    if _LOCK_FILE.exists():
-        try:
-            lock_stat = _LOCK_FILE.stat()
-            lock_age = _hermes_now().timestamp() - lock_stat.st_mtime
-            
-            # If lock is older than 5 minutes, it's definitely stale
-            if lock_age > 300:
-                logger.warning("Removing stale lock file (age=%.0fs)", lock_age)
-                _LOCK_FILE.unlink()
-            else:
-                # Check if holding process is still alive
-                with open(_LOCK_FILE, 'r') as f:
-                    content = f.read().strip()
-                    if content:
-                        parts = content.split(',')
-                        if len(parts) >= 1:
-                            old_pid = int(parts[0])
-                            import psutil
-                            if not psutil.pid_exists(old_pid):
-                                logger.warning("Removing orphaned lock file from dead process %d", old_pid)
-                                _LOCK_FILE.unlink()
-        except (ValueError, OSError, ImportError):
-            # Can't parse or check - remove stale lock
-            try:
-                _LOCK_FILE.unlink()
-            except OSError:
-                pass
-
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
@@ -1031,17 +937,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             lock_fd.close()
         return 0
 
-    # Write PID to lock file so we can detect orphaned locks later
     try:
-        lock_fd.write(f"{os.getpid()},{_hermes_now().timestamp()}")
-        lock_fd.flush()
-    except OSError:
-        pass
-
-    try:
-        # Health check: auto-resume stuck jobs that were paused > 24h ago
-        _auto_resume_stuck_jobs()
-
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
@@ -1051,30 +947,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run for all due jobs while holding the lock
-        # This prevents re-firing if process crashes during execution
-        for job in due_jobs:
-            advance_next_run(job["id"])
-        
-        # Release the tick lock before executing jobs
-        # This allows concurrent execution without blocking other ticks
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
-        lock_fd = None
-
-        # Execute jobs concurrently with ThreadPoolExecutor
         executed = 0
-        max_workers = min(MAX_WORKERS, len(due_jobs))
-        
-        def _execute_single_job(job):
-            """Execute a single job outside the tick lock."""
+        for job in due_jobs:
             try:
+                # For recurring jobs (cron/interval), advance next_run_at to the
+                # next future occurrence BEFORE execution.  This way, if the
+                # process crashes mid-run, the job won't re-fire on restart.
+                # One-shot jobs are left alone so they can retry on restart.
+                advance_next_run(job["id"])
+
                 success, output, final_response, error = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
@@ -1082,6 +963,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     logger.info("Output saved to: %s", output_file)
 
                 # Deliver the final response to the origin/target chat.
+                # If the agent responded with [SILENT], skip delivery (but
+                # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
@@ -1096,53 +979,30 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
-                # Treat empty final_response as a soft failure
+                # Treat empty final_response as a soft failure so last_status
+                # is not "ok" — the agent ran but produced nothing useful.
+                # (issue #8585)
                 if success and not final_response:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                return True
+                executed += 1
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
-                return False
-
-        if len(due_jobs) == 1:
-            # Single job - run directly
-            if _execute_single_job(due_jobs[0]):
-                executed += 1
-        else:
-            # Multiple jobs - run concurrently
-            logger.info("Running %d jobs with %d concurrent workers", len(due_jobs), max_workers)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_job = {
-                    executor.submit(_execute_single_job, job): job
-                    for job in due_jobs
-                }
-                
-                for future in concurrent.futures.as_completed(future_to_job):
-                    job = future_to_job[future]
-                    try:
-                        if future.result():
-                            executed += 1
-                    except Exception as exc:
-                        logger.error("Job '%s' generated an exception: %s", job.get('name', job['id']), exc)
-                        mark_job_run(job["id"], False, str(exc))
 
         return executed
     finally:
-        # Only release lock if we still hold it (should be released before execution)
-        if lock_fd is not None:
-            if fcntl:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            elif msvcrt:
-                try:
-                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-                except (OSError, IOError):
-                    pass
-            lock_fd.close()
+        if fcntl:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        elif msvcrt:
+            try:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+        lock_fd.close()
 
 
 if __name__ == "__main__":

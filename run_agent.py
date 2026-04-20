@@ -6697,13 +6697,6 @@ class AIAgent:
             "messages": sanitized_messages,
             "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
         }
-        # kimi-for-coding only accepts temperature=0.6
-        logger.info("DEBUG _build_api_kwargs model=%s api_mode=%s base_url=%s", self.model, self.api_mode, self.base_url)
-        _is_kimi_endpoint = "api.kimi.com" in (self.base_url or "").lower()
-        _is_kimi_model = "kimi" in (self.model or "").lower()
-        if _is_kimi_endpoint or _is_kimi_model:
-            api_kwargs["temperature"] = 0.6
-            logger.info("Set temperature=0.6 for Kimi model: %s (endpoint: %s)", self.model, self.base_url)
         if self._is_qwen_portal():
             api_kwargs["metadata"] = {
                 "sessionId": self.session_id or "hermes",
