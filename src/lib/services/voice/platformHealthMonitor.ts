@@ -182,16 +182,27 @@ export async function getAllPlatformHealth(tenantId?: string): Promise<PlatformH
    180|/**
    181| * Stop health monitoring for a tenant's platform
    182| */
-   183|export function stopHealthMonitoring(tenantId: string): void {
-   184|  const cacheKey = `${tenantId}:monitor`;
-   185|  const interval = activeMonitors.get(cacheKey);
-   186|  
-   187|  if (interval) {
-   188|    clearInterval(interval);
-   189|    activeMonitors.delete(cacheKey);
-   190|    logger.info('Stopped platform health monitoring', { tenantId });
-   191|  }
-   192|}
+export function stopHealthMonitoring(tenantId: string): void {
+  const cacheKey = `${tenantId}:monitor`;
+  const interval = activeMonitors.get(cacheKey);
+  
+  if (interval) {
+    clearInterval(interval);
+    activeMonitors.delete(cacheKey);
+    // Clean up cached health data for this tenant to prevent memory leaks
+    for (const key of healthStatusMap.keys()) {
+      if (key.startsWith(`${tenantId}:`)) {
+        healthStatusMap.delete(key);
+      }
+    }
+    for (const key of healthHistoryMap.keys()) {
+      if (key.startsWith(`${tenantId}:`)) {
+        healthHistoryMap.delete(key);
+      }
+    }
+    logger.info('Stopped platform health monitoring', { tenantId });
+  }
+}
    193|
    194|/**
    195| * Perform a health check for a tenant's platform
@@ -375,14 +386,16 @@ export async function getAllPlatformHealth(tenantId?: string): Promise<PlatformH
    373|/**
    374| * Stop all health monitoring
    375| */
-   376|export function stopAllHealthMonitoring(): void {
-   377|  for (const [key, interval] of activeMonitors.entries()) {
-   378|    clearInterval(interval);
-   379|    activeMonitors.delete(key);
-   380|  }
-   381|
-   382|  logger.info('Stopped all platform health monitoring');
-   383|}
+export function stopAllHealthMonitoring(): void {
+  for (const [key, interval] of activeMonitors.entries()) {
+    clearInterval(interval);
+    activeMonitors.delete(key);
+  }
+  healthStatusMap.clear();
+  healthHistoryMap.clear();
+
+  logger.info('Stopped all platform health monitoring');
+}
    384|
    385|/**
    386| * Get platform comparison data for a tenant
@@ -444,12 +457,33 @@ export async function getAllPlatformHealth(tenantId?: string): Promise<PlatformH
    442|  return comparisons;
    443|}
    444|
-   445|// Cleanup on process exit
-   446|process.on('SIGINT', () => {
-   447|  stopAllHealthMonitoring();
-   448|});
-   449|
-   450|process.on('SIGTERM', () => {
-   451|  stopAllHealthMonitoring();
-   452|});
+// Cleanup on process exit — use stable global references so HMR reloads
+// remove the old handlers before adding new ones, preventing listener leaks.
+const HEALTH_MONITOR_SIGINT = Symbol.for('cxc:platformHealthMonitor:sigint');
+const HEALTH_MONITOR_SIGTERM = Symbol.for('cxc:platformHealthMonitor:sigterm');
+
+const healthMonitorSigintHandler = () => {
+  stopAllHealthMonitoring();
+  healthStatusMap.clear();
+  healthHistoryMap.clear();
+};
+const healthMonitorSigtermHandler = () => {
+  stopAllHealthMonitoring();
+  healthStatusMap.clear();
+  healthHistoryMap.clear();
+};
+
+// Remove any previously-registered handlers (from prior HMR load)
+const oldSigint = (globalThis as unknown as Record<symbol, (() => void) | undefined>)[HEALTH_MONITOR_SIGINT];
+const oldSigterm = (globalThis as unknown as Record<symbol, (() => void) | undefined>)[HEALTH_MONITOR_SIGTERM];
+if (oldSigint) {
+  process.removeListener('SIGINT', oldSigint);
+}
+if (oldSigterm) {
+  process.removeListener('SIGTERM', oldSigterm);
+}
+(globalThis as unknown as Record<symbol, (() => void) | undefined>)[HEALTH_MONITOR_SIGINT] = healthMonitorSigintHandler;
+(globalThis as unknown as Record<symbol, (() => void) | undefined>)[HEALTH_MONITOR_SIGTERM] = healthMonitorSigtermHandler;
+process.on('SIGINT', healthMonitorSigintHandler);
+process.on('SIGTERM', healthMonitorSigtermHandler);
    453|

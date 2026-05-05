@@ -53,10 +53,20 @@ const activeWatchers = new Map<string, NodeJS.Timeout>();
 
 /**
  * Get configuration for a tenant's platform
+ * CRITICAL FIX: Added optional platform filter and deterministic ordering
+ * to prevent cross-platform leakage when a tenant has multiple platforms.
  */
-export async function getPlatformConfiguration(tenantId: string): Promise<PlatformConfiguration | null> {
+export async function getPlatformConfiguration(tenantId: string, platform?: string): Promise<PlatformConfiguration | null> {
+  const params: string[] = [tenantId];
+  let whereClause = 'tpc.tenant_id = $1 AND tpc.is_active = true';
+
+  if (platform) {
+    whereClause += ' AND tpc.platform = $2';
+    params.push(platform);
+  }
+
   const result = await query(
-    `SELECT 
+    `SELECT
       tpc.tenant_id,
       tpc.platform,
       tpc.api_base_url,
@@ -72,8 +82,9 @@ export async function getPlatformConfiguration(tenantId: string): Promise<Platfo
       tpc.updated_at,
       COALESCE(tpc.config, '{}') as settings
     FROM tenant_platform_configs tpc
-    WHERE tpc.tenant_id = $1 AND tpc.is_active = true`,
-    [tenantId]
+    WHERE ${whereClause}
+    ORDER BY tpc.platform`,
+    params
   );
 
   if (result.rows.length === 0) {
@@ -174,22 +185,27 @@ export async function updatePlatformConfiguration(
       return { success: false, error: 'No valid updates provided' };
     }
 
-    // Add tenant_id to values
+    // Add tenant_id and platform to values
     values.push(tenantId);
+    values.push(currentConfig.platform);
 
-    // Execute update
+    // Execute update - CRITICAL FIX: scope to specific platform to prevent
+    // cross-platform data corruption within the same tenant. Previously this
+    // updated ALL platform configs for the tenant, leaking settings between
+    // Amazon Connect, Cisco Webex, Genesys, FreeSWITCH, etc.
     await query(
-      `UPDATE tenant_platform_configs 
+      `UPDATE tenant_platform_configs
        SET ${setClauses.join(', ')}
-       WHERE tenant_id = $${paramIndex}`,
+       WHERE tenant_id = $${paramIndex} AND platform = $${paramIndex + 1}`,
       values
     );
 
     // Clear provider cache to force reload
     clearPlatformVoiceProviderCache(tenantId);
 
-    // Get updated config
-    const newConfig = await getPlatformConfiguration(tenantId);
+    // Get updated config - scoped to the specific platform to ensure
+    // we return the config we just updated, not another platform's config
+    const newConfig = await getPlatformConfiguration(tenantId, currentConfig.platform);
 
     // Log to audit trail
     await query(
@@ -295,6 +311,12 @@ export function stopConfigWatcher(tenantId: string): void {
   if (interval) {
     clearInterval(interval);
     activeWatchers.delete(watcherKey);
+    // Clean up cached hash entries for this tenant to prevent memory leaks
+    for (const key of configHashMap.keys()) {
+      if (key.startsWith(`${tenantId}:`)) {
+        configHashMap.delete(key);
+      }
+    }
     logger.info('Stopped platform config watcher', { tenantId });
   }
 }
@@ -481,7 +503,9 @@ export async function validateAllConfigurations(tenantId?: string): Promise<Arra
   const validations = [];
 
   for (const row of result.rows) {
-    const config = await getPlatformConfiguration(row.tenant_id);
+    // CRITICAL FIX: pass the specific platform to ensure we validate the
+    // correct configuration, not a different platform for the same tenant.
+    const config = await getPlatformConfiguration(row.tenant_id, row.platform);
     const errors: string[] = [];
 
     if (!config) {
@@ -511,10 +535,20 @@ export async function validateAllConfigurations(tenantId?: string): Promise<Arra
   return validations;
 }
 
-// Cleanup on process exit
-process.on('SIGINT', () => {
+// Cleanup on process exit — use a stable global reference so HMR reloads
+// remove the old handler before adding a new one, preventing listener leaks.
+const CONFIG_MANAGER_SIGINT = Symbol.for('cxc:platformConfigManager:sigint');
+const configManagerSigintHandler = () => {
   for (const [key, interval] of activeWatchers.entries()) {
     clearInterval(interval);
   }
   activeWatchers.clear();
-});
+  configHashMap.clear();
+};
+// Remove any previously-registered handler (from prior HMR load)
+const oldHandler = (globalThis as unknown as Record<symbol, (() => void) | undefined>)[CONFIG_MANAGER_SIGINT];
+if (oldHandler) {
+  process.removeListener('SIGINT', oldHandler);
+}
+(globalThis as unknown as Record<symbol, (() => void) | undefined>)[CONFIG_MANAGER_SIGINT] = configManagerSigintHandler;
+process.on('SIGINT', configManagerSigintHandler);
