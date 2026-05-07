@@ -134,7 +134,7 @@ def calculate_agent_occupancy(
 
     occupied = row["total_occupied"] or 0
     available_net = row["total_available_net"] or 0
-    if available_net == 0:
+    if available_net <= 0:
         return None
     return round((occupied / available_net) * 100, 2)
 
@@ -152,13 +152,16 @@ def calculate_service_level(
     CORRECTION APPLIED 2024-05-07: Previously denominator included abandoned calls,
     which incorrectly penalized service level for customer hang-ups. Denominator
     now restricted to answered interactions only per COPC standard.
+    CORRECTION APPLIED 2026-05-08: Replaced julianday() arithmetic with
+    strftime('%s', ...) for exact integer-second precision, eliminating floating-point
+    drift that could misclassify borderline answer-time interactions.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d"), "threshold": threshold_seconds}
     sql = """
         SELECT
             SUM(CASE WHEN
-                (julianday(answer_time) - julianday(start_time)) * 86400 <= :threshold
+                (strftime('%s', answer_time) - strftime('%s', start_time)) <= :threshold
                 THEN 1 ELSE 0 END) as answered_within_threshold,
             COUNT(*) as total_answered
         FROM interactions
@@ -232,6 +235,8 @@ def calculate_acw_average(
     Formula: AVG(acw_time_seconds) for non-abandoned interactions
     CORRECTION APPLIED 2024-05-07: Previously included abandoned interactions (acw=0),
     artificially lowering ACW average by ~4 seconds. Filter now excludes abandoned records.
+    CORRECTION APPLIED 2026-05-08: Removed acw_time_seconds > 0 filter which artificially
+    inflated ACW by excluding legitimate zero-ACW interactions (chat, email wrap-ups).
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
@@ -242,7 +247,6 @@ def calculate_acw_average(
         FROM interactions
         WHERE date(start_time) = :metric_date
           AND abandoned = 0
-          AND acw_time_seconds > 0
     """
     if channel:
         sql += " AND channel = :channel"
@@ -306,6 +310,13 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
     """Calculate and persist all daily metrics for the given date."""
     conn = get_connection()
     results: Dict[str, Any] = {"date": metric_date.isoformat(), "metrics": []}
+
+    # Prevent duplicate bulk metric rows: SQLite UNIQUE treats NULLs as distinct,
+    # so ON CONFLICT with agent_id=NULL never fires. Delete existing bulk rows first.
+    conn.execute(
+        "DELETE FROM daily_metrics WHERE metric_date = ? AND agent_id IS NULL",
+        (metric_date,),
+    )
 
     metrics_to_compute = [
         ("fcr_rate", calculate_fcr_rate, None),
