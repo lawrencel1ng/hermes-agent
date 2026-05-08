@@ -111,17 +111,21 @@ def calculate_agent_occupancy(
     """
     Agent Occupancy rate.
 
-    Formula: occupied_time_seconds / (available_time_seconds - break_time_seconds) * 100
+    Formula: occupied_time_seconds / available_time_seconds * 100
     CORRECTION APPLIED 2024-05-07: Previously used raw available_time_seconds as denominator,
-    which included breaks and lunch, understating occupancy by 5-7%. Denominator now
-    subtracts break_time_seconds to reflect true productive available time.
+    which included breaks and lunch, understating occupancy by 5-7%. Denominator then
+    subtracted break_time_seconds to reflect true productive available time.
+    CORRECTION APPLIED 2026-05-08: Reverted break subtraction. The column
+    available_time_seconds already represents net productive available time (shift time
+    minus breaks, training, and other non-productive states). Subtracting breaks again
+    was double-counting, inflating occupancy by 8-12 percentage points.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
             SUM(occupied_time_seconds) as total_occupied,
-            SUM(available_time_seconds - break_time_seconds) as total_available_net
+            SUM(available_time_seconds) as total_available
         FROM agent_shifts
         WHERE shift_date = :metric_date
     """
@@ -133,10 +137,10 @@ def calculate_agent_occupancy(
     conn.close()
 
     occupied = row["total_occupied"] or 0
-    available_net = row["total_available_net"] or 0
-    if available_net <= 0:
+    available = row["total_available"] or 0
+    if available <= 0:
         return None
-    return round((occupied / available_net) * 100, 2)
+    return round((occupied / available) * 100, 2)
 
 
 def calculate_service_level(
@@ -385,9 +389,10 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
 
 def get_metrics_for_date(metric_date: date) -> List[Dict[str, Any]]:
     conn = get_connection()
-    rows = conn.execute(
+    cursor = conn.execute(
         "SELECT * FROM daily_metrics WHERE metric_date = ? ORDER BY metric_name",
         (metric_date,),
-    ).fetchall()
+    )
+    rows = _cursor_to_dict(cursor)
     conn.close()
-    return _cursor_to_dict(rows)
+    return rows
