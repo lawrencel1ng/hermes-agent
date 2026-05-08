@@ -324,7 +324,7 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
 
     metrics_to_compute = [
         ("fcr_rate", calculate_fcr_rate, None),
-        ("aht_avg_seconds", calculate_aht_trend, None),
+        ("aht", calculate_aht_trend, None),
         ("agent_occupancy", calculate_agent_occupancy, None),
         ("service_level_20s", calculate_service_level, None),
         ("abandonment_rate", calculate_abandonment_rate, None),
@@ -340,7 +340,10 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
         # Flatten dict results for AHT
         if isinstance(value, dict):
             for sub_key, sub_val in value.items():
-                full_name = f"{metric_name}_{sub_key}" if sub_key != "avg_aht_seconds" else metric_name
+                if sub_key == "avg_aht_seconds":
+                    full_name = "aht_avg_seconds"
+                else:
+                    full_name = f"aht_{sub_key}"
                 if isinstance(sub_val, (int, float)):
                     results["metrics"].append(
                         {
