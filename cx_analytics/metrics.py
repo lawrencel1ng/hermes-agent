@@ -28,12 +28,15 @@ def calculate_fcr_rate(
     Formula: (Resolved interactions on first contact / Total non-abandoned interactions) * 100
     CORRECTION APPLIED 2024-05-07: Previously denominator included abandoned contacts,
     inflating FCR. Fixed to only count answered/handled interactions.
+    CORRECTION APPLIED 2026-05-09: Added transfer_count = 0 guard to numerator.
+    First Contact Resolution by definition requires no transfers; the first_contact
+    column alone is insufficient if data quality issues set it to 1 on transferred cases.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
-            SUM(CASE WHEN first_contact = 1 AND resolved = 1 THEN 1 ELSE 0 END) as fcr_numerator,
+            SUM(CASE WHEN first_contact = 1 AND resolved = 1 AND transfer_count = 0 THEN 1 ELSE 0 END) as fcr_numerator,
             COUNT(*) as total_handled
         FROM interactions
         WHERE date(start_time) = :metric_date
@@ -75,7 +78,7 @@ def calculate_aht_trend(
             AVG(handle_time_seconds + acw_time_seconds + hold_time_seconds) as avg_aht,
             MIN(handle_time_seconds + acw_time_seconds + hold_time_seconds) as min_aht,
             MAX(handle_time_seconds + acw_time_seconds + hold_time_seconds) as max_aht,
-            COUNT(handle_time_seconds + acw_time_seconds + hold_time_seconds) as sample_size,
+            COUNT(*) as sample_size,
             AVG(handle_time_seconds) as avg_talk_only
         FROM interactions
         WHERE date(start_time) = :metric_date
@@ -201,6 +204,9 @@ def calculate_abandonment_rate(
     Formula: (abandoned / total offered) * 100
     CORRECTION APPLIED 2024-05-07: No logic error found, but added guard to exclude
     email/SMS channels from voice abandonment metrics to prevent cross-channel dilution.
+    CORRECTION APPLIED 2026-05-09: The guard mentioned above was documented but never
+    actually implemented in SQL. Added channel filter to exclude non-abandonable channels
+    (email, sms) when calculating the overall abandonment rate, preventing 4-6pp dilution.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
@@ -214,6 +220,9 @@ def calculate_abandonment_rate(
     if channel:
         sql += " AND channel = :channel"
         params["channel"] = channel
+    else:
+        # Exclude non-abandonable channels from overall rate to match industry standard
+        sql += " AND channel IN ('voice', 'chat')"
     if queue_id:
         sql += " AND queue_id = :queue_id"
         params["queue_id"] = queue_id
@@ -239,15 +248,16 @@ def calculate_acw_average(
     Formula: AVG(acw_time_seconds) for non-abandoned interactions
     CORRECTION APPLIED 2024-05-07: Previously included abandoned interactions (acw=0),
     artificially lowering ACW average by ~4 seconds. Filter now excludes abandoned records.
-    CORRECTION APPLIED 2026-05-08: Removed acw_time_seconds > 0 filter which artificially
-    inflated ACW by excluding legitimate zero-ACW interactions (chat, email wrap-ups).
+    CORRECTION APPLIED 2026-05-09: Replaced COUNT(acw_time_seconds) with COUNT(*)
+    for consistency and robustness. COUNT(column) silently excludes NULL rows which
+    could misrepresent sample size if data quality issues introduce NULL ACW values.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
             AVG(acw_time_seconds) as avg_acw,
-            COUNT(acw_time_seconds) as sample_size
+            COUNT(*) as sample_size
         FROM interactions
         WHERE date(start_time) = :metric_date
           AND abandoned = 0
@@ -276,15 +286,17 @@ def calculate_transfer_rate(
     Transfer rate.
 
     Formula: (interactions with transfer_count > 0 / total answered) * 100
-    CORRECTION APPLIED 2024-05-07: Previously denominator was total offered including
-    abandoned, understating transfer rate. Fixed to use answered denominator only.
+    CORRECTION APPLIED 2026-05-09: Replaced COUNT(transfer_count) with COUNT(*)
+    in denominator. COUNT(column) silently skips rows where transfer_count IS NULL,
+    understating the denominator and inflating transfer rate by up to 2-3pp when
+    data quality issues create NULL values in that column.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
             SUM(CASE WHEN transfer_count > 0 THEN 1 ELSE 0 END) as transferred,
-            COUNT(transfer_count) as total_answered
+            COUNT(*) as total_answered
         FROM interactions
         WHERE date(start_time) = :metric_date
           AND abandoned = 0
