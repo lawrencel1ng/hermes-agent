@@ -75,7 +75,7 @@ def calculate_aht_trend(
             AVG(handle_time_seconds + acw_time_seconds + hold_time_seconds) as avg_aht,
             MIN(handle_time_seconds + acw_time_seconds + hold_time_seconds) as min_aht,
             MAX(handle_time_seconds + acw_time_seconds + hold_time_seconds) as max_aht,
-            COUNT(*) as sample_size,
+            COUNT(handle_time_seconds + acw_time_seconds + hold_time_seconds) as sample_size,
             AVG(handle_time_seconds) as avg_talk_only
         FROM interactions
         WHERE date(start_time) = :metric_date
@@ -243,7 +243,7 @@ def calculate_acw_average(
     sql = """
         SELECT
             AVG(acw_time_seconds) as avg_acw,
-            COUNT(*) as sample_size
+            COUNT(acw_time_seconds) as sample_size
         FROM interactions
         WHERE date(start_time) = :metric_date
           AND abandoned = 0
@@ -280,7 +280,7 @@ def calculate_transfer_rate(
     sql = """
         SELECT
             SUM(CASE WHEN transfer_count > 0 THEN 1 ELSE 0 END) as transferred,
-            COUNT(*) as total_answered
+            COUNT(transfer_count) as total_answered
         FROM interactions
         WHERE date(start_time) = :metric_date
           AND abandoned = 0
