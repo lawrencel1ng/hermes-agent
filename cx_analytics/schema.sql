@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     UNIQUE(metric_date, metric_name, channel, queue_id, agent_id)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_shifts_unique ON agent_shifts(agent_id, shift_date);
 CREATE INDEX IF NOT EXISTS idx_interactions_date ON interactions(date(start_time));
 CREATE INDEX IF NOT EXISTS idx_interactions_agent ON interactions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_queue ON interactions(queue_id);

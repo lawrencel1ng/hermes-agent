@@ -162,13 +162,16 @@ def calculate_service_level(
     CORRECTION APPLIED 2026-05-08: Replaced julianday() arithmetic with
     strftime('%s', ...) for exact integer-second precision, eliminating floating-point
     drift that could misclassify borderline answer-time interactions.
+    CORRECTION APPLIED 2026-05-09: Wrapped strftime expressions in CAST(... AS INTEGER)
+    to ensure deterministic integer comparison and prevent any residual string-cast
+    ambiguity in SQLite type coercion.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d"), "threshold": threshold_seconds}
     sql = """
         SELECT
             SUM(CASE WHEN
-                (strftime('%s', answer_time) - strftime('%s', start_time)) <= :threshold
+                CAST(strftime('%s', answer_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER) <= :threshold
                 THEN 1 ELSE 0 END) as answered_within_threshold,
             COUNT(*) as total_answered
         FROM interactions
