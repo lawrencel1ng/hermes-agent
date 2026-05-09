@@ -75,9 +75,9 @@ def calculate_aht_trend(
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
-            AVG(handle_time_seconds + acw_time_seconds + hold_time_seconds) as avg_aht,
-            MIN(handle_time_seconds + acw_time_seconds + hold_time_seconds) as min_aht,
-            MAX(handle_time_seconds + acw_time_seconds + hold_time_seconds) as max_aht,
+            AVG(handle_time_seconds + COALESCE(acw_time_seconds, 0) + COALESCE(hold_time_seconds, 0)) as avg_aht,
+            MIN(handle_time_seconds + COALESCE(acw_time_seconds, 0) + COALESCE(hold_time_seconds, 0)) as min_aht,
+            MAX(handle_time_seconds + COALESCE(acw_time_seconds, 0) + COALESCE(hold_time_seconds, 0)) as max_aht,
             COUNT(*) as sample_size,
             AVG(handle_time_seconds) as avg_talk_only
         FROM interactions
@@ -295,7 +295,7 @@ def calculate_transfer_rate(
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
-            SUM(CASE WHEN transfer_count > 0 THEN 1 ELSE 0 END) as transferred,
+            SUM(CASE WHEN COALESCE(transfer_count, 0) > 0 THEN 1 ELSE 0 END) as transferred,
             COUNT(*) as total_answered
         FROM interactions
         WHERE date(start_time) = :metric_date
