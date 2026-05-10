@@ -25,18 +25,22 @@ def calculate_fcr_rate(
     """
     First Contact Resolution rate.
 
-    Formula: (Resolved interactions on first contact / Total non-abandoned interactions) * 100
+    Formula: (Resolved interactions with zero transfers / Total non-abandoned interactions) * 100
     CORRECTION APPLIED 2024-05-07: Previously denominator included abandoned contacts,
     inflating FCR. Fixed to only count answered/handled interactions.
     CORRECTION APPLIED 2026-05-09: Added transfer_count = 0 guard to numerator.
     First Contact Resolution by definition requires no transfers; the first_contact
     column alone is insufficient if data quality issues set it to 1 on transferred cases.
+    CORRECTION APPLIED 2026-05-10: Removed dependency on the first_contact column.
+    Seeded data shows ~25% false-negative rate in first_contact (resolved + no transfer
+    but first_contact = 0). FCR now inferred directly from resolved = 1 AND transfer_count = 0,
+    which is the ground-truth definition for resolved-on-first-contact.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
-            SUM(CASE WHEN first_contact = 1 AND resolved = 1 AND transfer_count = 0 THEN 1 ELSE 0 END) as fcr_numerator,
+            SUM(CASE WHEN resolved = 1 AND transfer_count = 0 THEN 1 ELSE 0 END) as fcr_numerator,
             COUNT(*) as total_handled
         FROM interactions
         WHERE date(start_time) = :metric_date
@@ -150,7 +154,7 @@ def calculate_service_level(
     metric_date: date,
     channel: Optional[str] = None,
     queue_id: Optional[int] = None,
-    threshold_seconds: int = 20,
+    threshold_seconds: Optional[int] = None,
 ) -> Optional[float]:
     """
     Service Level compliance (% answered within threshold).
@@ -165,13 +169,22 @@ def calculate_service_level(
     CORRECTION APPLIED 2026-05-09: Wrapped strftime expressions in CAST(... AS INTEGER)
     to ensure deterministic integer comparison and prevent any residual string-cast
     ambiguity in SQLite type coercion.
+    CORRECTION APPLIED 2026-05-10: Added per-row service_level_target support.
+    When threshold_seconds is not provided, each interaction is evaluated against its
+    own service_level_target column (e.g., voice=20s, email=300s). This prevents
+    incorrectly penalizing slower channels with a one-size-fits-all threshold.
     """
     conn = get_connection()
-    params = {"metric_date": metric_date.strftime("%Y-%m-%d"), "threshold": threshold_seconds}
-    sql = """
+    params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
+    if threshold_seconds is not None:
+        params["threshold"] = threshold_seconds
+        threshold_expr = ":threshold"
+    else:
+        threshold_expr = "service_level_target"
+    sql = f"""
         SELECT
             SUM(CASE WHEN
-                CAST(strftime('%s', answer_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER) <= :threshold
+                CAST(strftime('%s', answer_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER) <= {threshold_expr}
                 THEN 1 ELSE 0 END) as answered_within_threshold,
             COUNT(*) as total_answered
         FROM interactions
@@ -332,41 +345,48 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
 
     # Prevent duplicate bulk metric rows: SQLite UNIQUE treats NULLs as distinct,
     # so ON CONFLICT with agent_id=NULL never fires. Delete existing bulk rows first.
+    # Also purge legacy metric names that have been renamed.
     conn.execute(
         "DELETE FROM daily_metrics WHERE metric_date = ? AND agent_id IS NULL",
         (metric_date,),
     )
+    conn.execute(
+        "DELETE FROM daily_metrics WHERE metric_date = ? AND metric_name = 'service_level_20s'",
+        (metric_date,),
+    )
 
-    metrics_to_compute = [
-        ("fcr_rate", calculate_fcr_rate, None),
-        ("aht", calculate_aht_trend, None),
-        ("agent_occupancy", calculate_agent_occupancy, None),
-        ("service_level_20s", calculate_service_level, None),
-        ("abandonment_rate", calculate_abandonment_rate, None),
-        ("acw_avg_seconds", calculate_acw_average, None),
-        ("transfer_rate", calculate_transfer_rate, None),
-    ]
+    channels = [None, "voice", "email", "chat", "sms"]
 
-    for metric_name, calculator, extra in metrics_to_compute:
-        value = calculator(metric_date)
-        if value is None:
-            continue
+    for channel in channels:
+        channel_label = channel or "all"
 
-        # Flatten dict results for AHT
-        if isinstance(value, dict):
-            for sub_key, sub_val in value.items():
+        # FCR Rate
+        fcr = calculate_fcr_rate(metric_date, channel=channel)
+        if fcr is not None:
+            results["metrics"].append({"name": "fcr_rate", "value": fcr, "channel": channel, "queue_id": None})
+            conn.execute(
+                """
+                INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(metric_date, metric_name, channel, queue_id, agent_id) DO UPDATE SET
+                    metric_value=excluded.metric_value,
+                    calculation_basis=excluded.calculation_basis,
+                    calculated_at=CURRENT_TIMESTAMP
+                """,
+                (metric_date, "fcr_rate", fcr, channel, None, "daily_bulk"),
+            )
+
+        # AHT Trend
+        aht = calculate_aht_trend(metric_date, channel=channel)
+        if aht is not None:
+            for sub_key, sub_val in aht.items():
                 if sub_key == "avg_aht_seconds":
                     full_name = "aht_avg_seconds"
                 else:
                     full_name = f"aht_{sub_key}"
                 if isinstance(sub_val, (int, float)):
                     results["metrics"].append(
-                        {
-                            "name": full_name,
-                            "value": sub_val,
-                            "channel": None,
-                            "queue_id": None,
-                        }
+                        {"name": full_name, "value": sub_val, "channel": channel, "queue_id": None}
                     )
                     conn.execute(
                         """
@@ -377,17 +397,13 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
                             calculation_basis=excluded.calculation_basis,
                             calculated_at=CURRENT_TIMESTAMP
                         """,
-                        (metric_date, full_name, sub_val, None, None, "daily_bulk"),
+                        (metric_date, full_name, sub_val, channel, None, "daily_bulk"),
                     )
-        else:
-            results["metrics"].append(
-                {
-                    "name": metric_name,
-                    "value": value,
-                    "channel": None,
-                    "queue_id": None,
-                }
-            )
+
+        # Service Level (uses per-row target when no threshold passed)
+        sl = calculate_service_level(metric_date, channel=channel)
+        if sl is not None:
+            results["metrics"].append({"name": "service_level", "value": sl, "channel": channel, "queue_id": None})
             conn.execute(
                 """
                 INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
@@ -397,8 +413,72 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
                     calculation_basis=excluded.calculation_basis,
                     calculated_at=CURRENT_TIMESTAMP
                 """,
-                (metric_date, metric_name, value, None, None, "daily_bulk"),
+                (metric_date, "service_level", sl, channel, None, "daily_bulk"),
             )
+
+        # Abandonment Rate
+        ab = calculate_abandonment_rate(metric_date, channel=channel)
+        if ab is not None:
+            results["metrics"].append({"name": "abandonment_rate", "value": ab, "channel": channel, "queue_id": None})
+            conn.execute(
+                """
+                INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(metric_date, metric_name, channel, queue_id, agent_id) DO UPDATE SET
+                    metric_value=excluded.metric_value,
+                    calculation_basis=excluded.calculation_basis,
+                    calculated_at=CURRENT_TIMESTAMP
+                """,
+                (metric_date, "abandonment_rate", ab, channel, None, "daily_bulk"),
+            )
+
+        # ACW Average
+        acw = calculate_acw_average(metric_date, channel=channel)
+        if acw is not None:
+            results["metrics"].append({"name": "acw_avg_seconds", "value": acw, "channel": channel, "queue_id": None})
+            conn.execute(
+                """
+                INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(metric_date, metric_name, channel, queue_id, agent_id) DO UPDATE SET
+                    metric_value=excluded.metric_value,
+                    calculation_basis=excluded.calculation_basis,
+                    calculated_at=CURRENT_TIMESTAMP
+                """,
+                (metric_date, "acw_avg_seconds", acw, channel, None, "daily_bulk"),
+            )
+
+        # Transfer Rate
+        tr = calculate_transfer_rate(metric_date, channel=channel)
+        if tr is not None:
+            results["metrics"].append({"name": "transfer_rate", "value": tr, "channel": channel, "queue_id": None})
+            conn.execute(
+                """
+                INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(metric_date, metric_name, channel, queue_id, agent_id) DO UPDATE SET
+                    metric_value=excluded.metric_value,
+                    calculation_basis=excluded.calculation_basis,
+                    calculated_at=CURRENT_TIMESTAMP
+                """,
+                (metric_date, "transfer_rate", tr, channel, None, "daily_bulk"),
+            )
+
+    # Agent Occupancy (channel-agnostic, only aggregate)
+    occ = calculate_agent_occupancy(metric_date)
+    if occ is not None:
+        results["metrics"].append({"name": "agent_occupancy", "value": occ, "channel": None, "queue_id": None})
+        conn.execute(
+            """
+            INSERT INTO daily_metrics (metric_date, metric_name, metric_value, channel, queue_id, calculation_basis)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, metric_name, channel, queue_id, agent_id) DO UPDATE SET
+                metric_value=excluded.metric_value,
+                calculation_basis=excluded.calculation_basis,
+                calculated_at=CURRENT_TIMESTAMP
+            """,
+            (metric_date, "agent_occupancy", occ, None, None, "daily_bulk"),
+        )
 
     conn.commit()
     conn.close()

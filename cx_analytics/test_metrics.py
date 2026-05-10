@@ -105,6 +105,43 @@ class TestBPOMetrics(unittest.TestCase):
         val = calculate_fcr_rate(self.test_date)
         self.assertIsNotNone(val)
 
+    def test_fcr_ignores_first_contact_column(self):
+        # FCR should be based on resolved + zero transfers, not the first_contact flag.
+        # Inject a resolved, zero-transfer row with first_contact=0 (false negative).
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO interactions
+            (agent_id, queue_id, channel, start_time, answer_time, end_time,
+             handle_time_seconds, acw_time_seconds, hold_time_seconds,
+             transfer_count, abandoned, resolved, first_contact)
+            VALUES (1, 1, 'voice', ?, ?, ?, 300, 30, 0, 0, 0, 1, 0)
+            """,
+            (
+                self.test_date.strftime("%Y-%m-%d") + " 10:00:00",
+                self.test_date.strftime("%Y-%m-%d") + " 10:00:05",
+                self.test_date.strftime("%Y-%m-%d") + " 10:05:00",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        val = calculate_fcr_rate(self.test_date)
+        self.assertIsNotNone(val)
+        # The injected row should count toward FCR because resolved=1 and transfer_count=0
+        # even though first_contact=0.  Without the fix this would under-count.
+        # We can't assert an exact value because the seeded baseline changes, but we can
+        # verify it is strictly higher than the old first_contact-only formula would give.
+        conn = get_connection()
+        old_formula = conn.execute(
+            """
+            SELECT ROUND(100.0 * SUM(CASE WHEN first_contact=1 AND resolved=1 AND transfer_count=0 THEN 1 ELSE 0 END) / COUNT(*), 2)
+            FROM interactions WHERE date(start_time) = ? AND abandoned = 0
+            """,
+            (self.test_date.strftime("%Y-%m-%d"),),
+        ).fetchone()[0]
+        conn.close()
+        self.assertGreater(val, old_formula)
+
 
 if __name__ == "__main__":
     unittest.main()
