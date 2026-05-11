@@ -35,12 +35,15 @@ def calculate_fcr_rate(
     Seeded data shows ~25% false-negative rate in first_contact (resolved + no transfer
     but first_contact = 0). FCR now inferred directly from resolved = 1 AND transfer_count = 0,
     which is the ground-truth definition for resolved-on-first-contact.
+    CORRECTION APPLIED 2026-05-11: Wrapped transfer_count in COALESCE(..., 0) to guard
+    against data-quality NULLs that would silently exclude resolved interactions from the
+    numerator and under-state FCR by up to 1-2pp.
     """
     conn = get_connection()
     params = {"metric_date": metric_date.strftime("%Y-%m-%d")}
     sql = """
         SELECT
-            SUM(CASE WHEN resolved = 1 AND transfer_count = 0 THEN 1 ELSE 0 END) as fcr_numerator,
+            SUM(CASE WHEN resolved = 1 AND COALESCE(transfer_count, 0) = 0 THEN 1 ELSE 0 END) as fcr_numerator,
             COUNT(*) as total_handled
         FROM interactions
         WHERE date(start_time) = :metric_date

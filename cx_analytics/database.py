@@ -85,13 +85,16 @@ def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4) -> None:
                 resolved = 1 if random.random() < 0.82 else 0
                 first_contact = 1 if (resolved and transfer_count == 0 and random.random() < 0.75) else 0
 
+            # Realistic service-level targets per channel (seconds)
+            sl_target = {"voice": 20, "chat": 60, "email": 14400, "sms": 300}[channel]
+
             cursor.execute(
                 """
                 INSERT INTO interactions
                 (agent_id, queue_id, channel, start_time, answer_time, end_time,
                  handle_time_seconds, acw_time_seconds, hold_time_seconds,
-                 transfer_count, abandoned, resolved, first_contact)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 transfer_count, abandoned, resolved, first_contact, service_level_target)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id, queue_id, channel, start_time,
@@ -104,6 +107,7 @@ def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4) -> None:
                     abandoned,
                     resolved,
                     first_contact,
+                    sl_target,
                 ),
             )
 
