@@ -382,11 +382,15 @@ def run_daily_metrics(metric_date: date) -> Dict[str, Any]:
         # AHT Trend
         aht = calculate_aht_trend(metric_date, channel=channel)
         if aht is not None:
+            name_map = {
+                "avg_aht_seconds": "aht_avg_seconds",
+                "min_aht_seconds": "aht_min_seconds",
+                "max_aht_seconds": "aht_max_seconds",
+                "sample_size": "aht_sample_size",
+                "avg_talk_only_seconds": "aht_talk_only_seconds",
+            }
             for sub_key, sub_val in aht.items():
-                if sub_key == "avg_aht_seconds":
-                    full_name = "aht_avg_seconds"
-                else:
-                    full_name = f"aht_{sub_key}"
+                full_name = name_map.get(sub_key, f"aht_{sub_key}")
                 if isinstance(sub_val, (int, float)):
                     results["metrics"].append(
                         {"name": full_name, "value": sub_val, "channel": channel, "queue_id": None}
