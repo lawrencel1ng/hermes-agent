@@ -21,14 +21,14 @@ def init_schema() -> None:
     conn.close()
 
 
-def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4) -> None:
+def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4, append: bool = False) -> None:
     """Generate realistic sample interaction data for the past N days."""
     conn = get_connection()
     cursor = conn.cursor()
 
     # Check if data already exists
     cursor.execute("SELECT COUNT(*) FROM interactions")
-    if cursor.fetchone()[0] > 0:
+    if cursor.fetchone()[0] > 0 and not append:
         conn.close()
         return
 
@@ -38,6 +38,14 @@ def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4) -> None:
 
     for day_offset in range(days, 0, -1):
         day = now - timedelta(days=day_offset)
+        day_date = day.date()
+
+        # Skip dates that already have interactions when appending
+        if append:
+            cursor.execute("SELECT COUNT(*) FROM interactions WHERE date(start_time) = ?", (day_date,))
+            if cursor.fetchone()[0] > 0:
+                continue
+
         daily_volume = random.randint(800, 1200)
 
         for _ in range(daily_volume):
@@ -127,7 +135,7 @@ def seed_sample_data(days: int = 30, agents: int = 15, queues: int = 4) -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
-                (agent_id, day.date(), login, logout, scheduled, available, occupied, breaks),
+                (agent_id, day_date, login, logout, scheduled, available, occupied, breaks),
             )
 
     conn.commit()
